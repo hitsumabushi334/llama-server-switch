@@ -199,20 +199,40 @@ _TOKENS_PER_SECOND = re.compile(
     r"\(\s*[^,]*,\s*([0-9]+(?:\.[0-9]+)?)\s+tokens per second\s*\)",
     re.IGNORECASE,
 )
+_PROMPT_PROCESSING_SPEED = re.compile(
+    r"\bprompt processing\b.*?/\s*([0-9]+(?:\.[0-9]+)?)\s+tokens per second\b",
+    re.IGNORECASE,
+)
+_TOKEN_GENERATION_SPEED = re.compile(
+    r"\btg\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*t/s\b",
+    re.IGNORECASE,
+)
 
 
 def extract_metrics(line: str) -> dict[str, float]:
-    """llama.cpp の性能ログから PP/Tg の tok/s を取り出す。"""
-    match = _TOKENS_PER_SECOND.search(line)
-    if match is None:
-        return {}
+    """llama.cpp の各 timing ログ行から PP/Tg の最新 tok/s を取り出す。"""
+    metrics: dict[str, float] = {}
 
-    speed = float(match.group(1))
-    if "prompt eval time" in line.casefold():
-        return {"pp": speed}
-    if re.search(r"\beval time\s*=", line, re.IGNORECASE):
-        return {"tg": speed}
-    return {}
+    prompt_processing = _PROMPT_PROCESSING_SPEED.search(line)
+    if prompt_processing is not None:
+        metrics["pp"] = float(prompt_processing.group(1))
+    elif "prompt eval time" in line.casefold():
+        match = _TOKENS_PER_SECOND.search(line)
+        if match is not None:
+            metrics["pp"] = float(match.group(1))
+
+    token_generation = _TOKEN_GENERATION_SPEED.search(line)
+    if token_generation is not None:
+        metrics["tg"] = float(token_generation.group(1))
+    elif (
+        "prompt eval time" not in line.casefold()
+        and re.search(r"\beval time\s*=", line, re.IGNORECASE)
+    ):
+        match = _TOKENS_PER_SECOND.search(line)
+        if match is not None:
+            metrics["tg"] = float(match.group(1))
+
+    return metrics
 
 
 class LlamaServerController:

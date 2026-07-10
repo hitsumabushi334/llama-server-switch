@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
@@ -14,6 +15,7 @@ from llama_server_manager import (
 )
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "Config.json"
+EVENT_POLL_INTERVAL_MS = 25
 
 
 def format_metric_summary(metrics: dict[str, float]) -> str:
@@ -31,9 +33,13 @@ class LlamaServerApp(tk.Tk):
         self.minsize(720, 440)
 
         self._events: queue.Queue[tuple[str, object]] = queue.Queue()
-        self._operations: queue.Queue[tuple[str, ModelConfig | None]] = queue.Queue()
+        self._operations: queue.Queue[tuple[int, str, ModelConfig | None]] = queue.Queue()
         self._models: dict[str, ModelConfig] = {}
         self._metrics: dict[str, float] = {}
+        self._stop_requested_at: float | None = None
+        self._next_operation_id = 0
+        self._stop_request_id = 0
+        self._executing_operation_id = 0
         self._status = tk.StringVar(value="Config.json を読み込んでいます。")
         self._metrics_text = tk.StringVar(value=format_metric_summary(self._metrics))
         self._selected_model = tk.StringVar()
@@ -41,8 +47,10 @@ class LlamaServerApp(tk.Tk):
             runtime=WindowsServerRuntime(),
             on_log=lambda line: self._events.put(("log", line)),
             on_metrics=lambda metrics: self._events.put(("metrics", metrics)),
-            on_started=lambda model: self._events.put(("operation_complete", ("start", model))),
-            on_exit=lambda exit_code: self._events.put(("server_exit", exit_code)),
+            on_started=lambda model: self._events.put(
+                ("operation_complete", (self._executing_operation_id, "start", model))
+            ),
+            on_exit=lambda exit_code: self._events.put(("server_exit", (time.monotonic(), exit_code))),
         )
         threading.Thread(
             target=self._operation_worker,
@@ -52,7 +60,7 @@ class LlamaServerApp(tk.Tk):
 
         self._build_widgets()
         self._reload_config()
-        self.after(100, self._drain_events)
+        self.after(EVENT_POLL_INTERVAL_MS, self._drain_events)
 
     def _build_widgets(self) -> None:
         container = ttk.Frame(self, padding=12)
@@ -139,21 +147,33 @@ class LlamaServerApp(tk.Tk):
         self._run_operation("start", model)
 
     def _stop(self) -> None:
+        self._stop_requested_at = time.monotonic()
         self._status.set("サーバーを停止中です。")
         self._run_operation("stop", None)
 
-    def _run_operation(self, operation: str, model: ModelConfig | None) -> None:
-        self._operations.put((operation, model))
+    def _run_operation(self, operation: str, model: ModelConfig | None) -> int:
+        self._next_operation_id += 1
+        operation_id = self._next_operation_id
+        if operation == "stop":
+            self._stop_request_id = operation_id
+        self._operations.put((operation_id, operation, model))
+        return operation_id
 
     def _operation_worker(self) -> None:
         while True:
-            operation, model = self._operations.get()
+            operation_id, operation, model = self._operations.get()
             try:
-                self._execute_operation(operation, model)
+                self._executing_operation_id = operation_id
+                self._execute_operation(operation_id, operation, model)
             finally:
                 self._operations.task_done()
 
-    def _execute_operation(self, operation: str, model: ModelConfig | None) -> None:
+    def _execute_operation(
+        self,
+        operation_id: int,
+        operation: str,
+        model: ModelConfig | None,
+    ) -> None:
         try:
             if operation == "start":
                 if model is None:
@@ -161,9 +181,9 @@ class LlamaServerApp(tk.Tk):
                 self._controller.start(model)
             else:
                 self._controller.stop()
-                self._events.put(("operation_complete", ("stop", None)))
+                self._events.put(("operation_complete", (operation_id, "stop", None)))
         except Exception as error:
-            self._events.put(("operation_error", (operation, str(error))))
+            self._events.put(("operation_error", (operation_id, operation, str(error))))
 
     def _drain_events(self) -> None:
         for _ in range(200):
@@ -178,18 +198,26 @@ class LlamaServerApp(tk.Tk):
                 self._metrics.update(value)  # type: ignore[arg-type]
                 self._metrics_text.set(format_metric_summary(self._metrics))
             elif kind == "operation_complete":
-                operation, model = value  # type: ignore[misc]
+                operation_id, operation, model = value  # type: ignore[misc]
                 if operation == "start" and isinstance(model, ModelConfig):
+                    if operation_id < self._stop_request_id:
+                        continue
+                    self._stop_requested_at = None
                     self._metrics.clear()
                     self._metrics_text.set(format_metric_summary(self._metrics))
                     self._status.set(f"起動中: {model.name}")
                     self._append_log(f"$ llama-server {' '.join(model.arguments)}")
-                elif operation == "stop":
+                elif operation == "stop" and operation_id == self._stop_request_id:
+                    self._stop_requested_at = None
                     self._status.set("すべての llama-server を停止しました。")
                     self._append_log("llama-server を停止しました。")
             elif kind == "operation_error":
-                operation, message = value  # type: ignore[misc]
+                operation_id, operation, message = value  # type: ignore[misc]
+                if operation == "start" and operation_id < self._stop_request_id:
+                    continue
                 is_start = operation == "start"
+                if not is_start and operation_id == self._stop_request_id:
+                    self._stop_requested_at = None
                 self._status.set(
                     "サーバーを起動できませんでした。"
                     if is_start
@@ -198,13 +226,19 @@ class LlamaServerApp(tk.Tk):
                 self._append_log(message)
                 messagebox.showerror("起動エラー" if is_start else "停止エラー", message, parent=self)
             elif kind == "server_exit":
-                exit_code = int(value)
+                exit_at, exit_code = value  # type: ignore[misc]
+                if (
+                    self._stop_requested_at is not None
+                    and float(exit_at) >= self._stop_requested_at
+                ):
+                    continue
+                exit_code = int(exit_code)
                 if exit_code == 0:
                     self._status.set("llama-server は終了しました。")
                 else:
                     self._status.set(f"llama-server が異常終了しました (終了コード: {exit_code})。")
                 self._append_log(f"llama-server は終了しました (終了コード: {exit_code})。")
-        self.after(100, self._drain_events)
+        self.after(EVENT_POLL_INTERVAL_MS, self._drain_events)
 
     def _append_log(self, line: str) -> None:
         self._log.configure(state=tk.NORMAL)

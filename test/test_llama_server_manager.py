@@ -103,6 +103,20 @@ class MetricExtractionTests(unittest.TestCase):
         self.assertEqual(extract_metrics(prompt_line), {"pp": 20.0})
         self.assertEqual(extract_metrics(generation_line), {"tg": 25.0})
 
+    def test_extracts_pp_and_tg_from_current_slot_timing_logs(self) -> None:
+        prompt_log = (
+            "1.30.169.827 I slot print_timing: id  0 | task 0 | "
+            "prompt processing, n_tokens =  16384, progress = 0.66, "
+            "t =  35.64 s / 459.68 tokens per second"
+        )
+        generation_log = (
+            "4.38.994.944 I slot print_timing: id  0 | task 544 | "
+            "n_decoded =    206, tg =  35.33 t/s"
+        )
+
+        self.assertEqual(extract_metrics(prompt_log), {"pp": 459.68})
+        self.assertEqual(extract_metrics(generation_log), {"tg": 35.33})
+
 
 
 class MetricSummaryTests(unittest.TestCase):
@@ -124,11 +138,11 @@ class OperationQueueTests(unittest.TestCase):
         app._controller = FailingController()
         app._events = queue.Queue()
 
-        app._execute_operation("stop", None)
+        app._execute_operation(0, "stop", None)
 
         self.assertEqual(
             app._events.get_nowait(),
-            ("operation_error", ("stop", "llama-server を停止できませんでした (PID: 444)。")),
+            ("operation_error", (0, "stop", "llama-server を停止できませんでした (PID: 444)。")),
         )
 
     def test_operation_requests_are_queued_in_submission_order(self) -> None:
@@ -144,12 +158,14 @@ class OperationQueueTests(unittest.TestCase):
         app._controller = WorkingController()
         app._events = queue.Queue()
         app._operations = queue.Queue()
+        app._next_operation_id = 0
+        app._stop_request_id = 0
 
         app._run_operation("start", model)
         app._run_operation("stop", None)
 
-        self.assertEqual(app._operations.get_nowait(), ("start", model))
-        self.assertEqual(app._operations.get_nowait(), ("stop", None))
+        self.assertEqual(app._operations.get_nowait(), (1, "start", model))
+        self.assertEqual(app._operations.get_nowait(), (2, "stop", None))
 
     def test_start_completion_discards_prior_model_metric_events(self) -> None:
         class Value:
@@ -163,7 +179,8 @@ class OperationQueueTests(unittest.TestCase):
         app = object.__new__(LlamaServerApp)
         app._events = queue.Queue()
         app._events.put(("metrics", {"tg": 25.0, "pp": 20.0}))
-        app._events.put(("operation_complete", ("start", model)))
+        app._events.put(("operation_complete", (1, "start", model)))
+        app._stop_request_id = 0
         app._metrics = {}
         app._metrics_text = Value()
         app._status = Value()
@@ -174,6 +191,98 @@ class OperationQueueTests(unittest.TestCase):
 
         self.assertEqual(app._metrics, {})
         self.assertEqual(app._metrics_text.value, "Tg: -- tok/s | PP: -- tok/s")
+
+    def test_later_stop_request_is_not_cleared_by_an_older_start_completion(self) -> None:
+        class Value:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        model = ModelConfig(name="A", arguments=("--model", "A.gguf"))
+        app = object.__new__(LlamaServerApp)
+        app._events = queue.Queue()
+        app._events.put(("operation_complete", (1, "start", model)))
+        app._stop_request_id = 2
+        app._stop_requested_at = 2.0
+        app._metrics = {}
+        app._metrics_text = Value()
+        app._status = Value()
+        app._append_log = lambda _line: None
+        app.after = lambda _delay, _callback: None
+
+        app._drain_events()
+
+        self.assertEqual(app._stop_requested_at, 2.0)
+        self.assertEqual(app._status.value, "")
+
+    def test_manual_stop_ignores_a_late_server_exit_event(self) -> None:
+        class Value:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        app = object.__new__(LlamaServerApp)
+        app._events = queue.Queue()
+        app._status = Value()
+        app._run_operation = lambda _operation, _model: None
+        logs: list[str] = []
+        app.after = lambda _delay, _callback: None
+
+        app._stop()
+        app._events.put(("server_exit", (app._stop_requested_at + 1.0, 1)))
+        app._drain_events()
+
+        self.assertIsNotNone(app._stop_requested_at)
+        self.assertEqual(app._status.value, "サーバーを停止中です。")
+        self.assertEqual(logs, [])
+
+    def test_successful_stop_clears_exit_suppression_timestamp(self) -> None:
+        class Value:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        app = object.__new__(LlamaServerApp)
+        app._events = queue.Queue()
+        app._events.put(("operation_complete", (2, "stop", None)))
+        app._stop_request_id = 2
+        app._stop_requested_at = 1.0
+        app._status = Value()
+        app._append_log = lambda _line: None
+        app.after = lambda _delay, _callback: None
+
+        app._drain_events()
+
+        self.assertIsNone(app._stop_requested_at)
+        self.assertEqual(app._status.value, "すべての llama-server を停止しました。")
+
+    def test_crash_before_manual_stop_is_still_reported(self) -> None:
+        class Value:
+            def __init__(self) -> None:
+                self.value = ""
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        app = object.__new__(LlamaServerApp)
+        app._events = queue.Queue()
+        app._events.put(("server_exit", (1.0, 1)))
+        app._stop_requested_at = 2.0
+        app._status = Value()
+        logs: list[str] = []
+        app._append_log = logs.append
+        app.after = lambda _delay, _callback: None
+
+        app._drain_events()
+
+        self.assertEqual(app._status.value, "llama-server が異常終了しました (終了コード: 1)。")
+        self.assertEqual(logs, ["llama-server は終了しました (終了コード: 1)。"])
 class LlamaServerControllerTests(unittest.TestCase):
     def test_start_terminates_all_existing_servers_before_using_alias(self) -> None:
         runtime = FakeRuntime(pids=[101, 202])
