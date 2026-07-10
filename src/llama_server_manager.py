@@ -1,0 +1,289 @@
+from __future__ import annotations
+
+import csv
+import ctypes
+import json
+import re
+import shutil
+import subprocess
+from contextlib import contextmanager
+import threading
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from ctypes import wintypes
+from pathlib import Path
+from typing import Protocol
+
+EXECUTABLE_ALIAS = "llama-server"
+SERVER_MUTEX_NAME = r"Global\llama-server-switch"
+MUTEX_SECURITY_SDDL = "D:(A;;0x001F0001;;;WD)"
+
+
+class SecurityAttributes(ctypes.Structure):
+    _fields_ = [
+        ("nLength", wintypes.DWORD),
+        ("lpSecurityDescriptor", wintypes.LPVOID),
+        ("bInheritHandle", wintypes.BOOL),
+    ]
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    name: str
+    arguments: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ServerConfig:
+    models: tuple[ModelConfig, ...]
+
+    @classmethod
+    def load(cls, path: Path) -> "ServerConfig":
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError as error:
+            raise ValueError(f"設定ファイルが見つかりません: {path}") from error
+        except json.JSONDecodeError as error:
+            raise ValueError(f"Config.json の形式が不正です: {error.msg}") from error
+
+        if not isinstance(data, dict) or not isinstance(data.get("models"), list):
+            raise ValueError('Config.json は "models" 配列を含む必要があります。')
+
+        models: list[ModelConfig] = []
+        names: set[str] = set()
+        for index, entry in enumerate(data["models"], start=1):
+            if not isinstance(entry, dict):
+                raise ValueError(f"models[{index}] はオブジェクトである必要があります。")
+            name = entry.get("name")
+            arguments = entry.get("arguments")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"models[{index}].name は空でない文字列である必要があります。")
+            if not isinstance(arguments, list) or not all(
+                isinstance(argument, str) and argument for argument in arguments
+            ):
+                raise ValueError(f"models[{index}].arguments は文字列配列である必要があります。")
+
+            normalized_name = name.casefold()
+            if normalized_name in names:
+                raise ValueError(f"モデル名が重複しています: {name}")
+            names.add(normalized_name)
+            models.append(ModelConfig(name=name, arguments=tuple(arguments)))
+
+        return cls(models=tuple(models))
+
+
+class RunningProcess(Protocol):
+    stdout: Iterable[str]
+
+    def wait(self) -> int: ...
+
+
+class ServerRuntime(Protocol):
+    def find_server_pids(self) -> list[int]: ...
+
+    def terminate_tree(self, pid: int) -> None: ...
+
+    def start(self, command: list[str]) -> RunningProcess: ...
+
+    def exclusive_server_operation(self): ...
+
+
+class WindowsServerRuntime:
+    """Windows 標準コマンドで llama-server.exe を管理する実行環境。"""
+
+    @contextmanager
+    def exclusive_server_operation(self):
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_mutex = kernel32.CreateMutexW
+        create_mutex.argtypes = [ctypes.POINTER(SecurityAttributes), wintypes.BOOL, wintypes.LPCWSTR]
+        create_mutex.restype = wintypes.HANDLE
+        wait_for_mutex = kernel32.WaitForSingleObject
+        wait_for_mutex.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        wait_for_mutex.restype = wintypes.DWORD
+
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        convert_descriptor = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+        convert_descriptor.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.LPVOID),
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        convert_descriptor.restype = wintypes.BOOL
+
+        descriptor = wintypes.LPVOID()
+        descriptor_size = wintypes.DWORD()
+        if not convert_descriptor(
+            MUTEX_SECURITY_SDDL,
+            1,
+            ctypes.byref(descriptor),
+            ctypes.byref(descriptor_size),
+        ):
+            raise OSError(ctypes.get_last_error(), "llama-server 排他ロックの ACL を作成できません。")
+
+        security_attributes = SecurityAttributes(
+            ctypes.sizeof(SecurityAttributes),
+            descriptor,
+            False,
+        )
+        mutex = create_mutex(ctypes.byref(security_attributes), False, SERVER_MUTEX_NAME)
+        create_error = ctypes.get_last_error()
+        kernel32.LocalFree(descriptor)
+        if not mutex:
+            raise OSError(create_error, "llama-server の排他ロックを作成できません。")
+
+        acquired = False
+        try:
+            wait_result = wait_for_mutex(mutex, 30_000)
+            if wait_result not in (0, 0x80):
+                raise RuntimeError("別の管理ツールが llama-server を切り替え中です。")
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                kernel32.ReleaseMutex(mutex)
+            kernel32.CloseHandle(mutex)
+
+    def find_server_pids(self) -> list[int]:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq llama-server.exe", "/FO", "CSV", "/NH"],
+            capture_output=True,
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+        if result.returncode != 0:
+            details = result.stderr.strip()
+            raise RuntimeError(f"tasklist に失敗しました: {details or result.returncode}")
+        pids: list[int] = []
+        for row in csv.reader(result.stdout.splitlines()):
+            if len(row) < 2 or row[0].casefold() != "llama-server.exe":
+                continue
+            try:
+                pids.append(int(row[1]))
+            except ValueError:
+                continue
+        return pids
+
+    def terminate_tree(self, pid: int) -> None:
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            check=False,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+        )
+
+    def start(self, command: list[str]) -> RunningProcess:
+        if shutil.which(command[0]) is None:
+            raise RuntimeError(
+                '"llama-server" が PATH 上に見つかりません。Vulkan ビルドの '\
+                "llama-server.exe を PATH に追加してください。"
+            )
+        return subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+
+
+_TOKENS_PER_SECOND = re.compile(
+    r"\(\s*[^,]*,\s*([0-9]+(?:\.[0-9]+)?)\s+tokens per second\s*\)",
+    re.IGNORECASE,
+)
+
+
+def extract_metrics(line: str) -> dict[str, float]:
+    """llama.cpp の性能ログから PP/Tg の tok/s を取り出す。"""
+    match = _TOKENS_PER_SECOND.search(line)
+    if match is None:
+        return {}
+
+    speed = float(match.group(1))
+    if "prompt eval time" in line.casefold():
+        return {"pp": speed}
+    if re.search(r"\beval time\s*=", line, re.IGNORECASE):
+        return {"tg": speed}
+    return {}
+
+
+class LlamaServerController:
+    def __init__(
+        self,
+        runtime: ServerRuntime,
+        on_log: Callable[[str], None],
+        on_metrics: Callable[[dict[str, float]], None] | None = None,
+        on_started: Callable[[ModelConfig], None] | None = None,
+        on_exit: Callable[[int], None] | None = None,
+    ) -> None:
+        self._runtime = runtime
+        self._on_log = on_log
+        self._on_metrics = on_metrics or (lambda _metrics: None)
+        self._on_started = on_started or (lambda _model: None)
+        self._on_exit = on_exit or (lambda _exit_code: None)
+        self._lock = threading.RLock()
+        self._process: RunningProcess | None = None
+        self._generation = 0
+
+    def start(self, model: ModelConfig) -> None:
+        with self._lock, self._runtime.exclusive_server_operation():
+            self._stop_existing_servers()
+            self._generation += 1
+            generation = self._generation
+            command = [EXECUTABLE_ALIAS, *model.arguments]
+            process = self._runtime.start(command)
+            self._process = process
+            self._on_started(model)
+            threading.Thread(
+                target=self._stream_logs,
+                args=(process, generation),
+                name="llama-server-log-reader",
+                daemon=True,
+            ).start()
+
+    def stop(self) -> None:
+        with self._lock, self._runtime.exclusive_server_operation():
+            self._stop_existing_servers()
+            self._generation += 1
+
+    def _stop_existing_servers(self) -> None:
+        for pid in self._runtime.find_server_pids():
+            self._runtime.terminate_tree(pid)
+        remaining_pids = self._runtime.find_server_pids()
+        if remaining_pids:
+            pids = ", ".join(map(str, remaining_pids))
+            raise RuntimeError(f"llama-server を停止できませんでした (PID: {pids})。")
+        self._process = None
+
+    def _stream_logs(self, process: RunningProcess, generation: int) -> None:
+        try:
+            for raw_line in process.stdout:
+                line = raw_line.rstrip("\r\n")
+                if not line:
+                    continue
+                self._on_log(line)
+                metrics = extract_metrics(line)
+                if metrics:
+                    with self._lock:
+                        is_current_process = (
+                            process is self._process and generation == self._generation
+                        )
+                        if is_current_process:
+                            self._on_metrics(metrics)
+        finally:
+            exit_code = process.wait()
+            with self._lock:
+                is_current_process = (
+                    process is self._process and generation == self._generation
+                )
+                if is_current_process:
+                    self._process = None
+                    self._on_exit(exit_code)
