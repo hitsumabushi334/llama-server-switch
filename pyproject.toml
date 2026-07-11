@@ -9,5 +9,6 @@ dependencies = []
 [dependency-groups]
 dev = [
     "basedpyright>=1.39.9",
+    "pyinstaller>=6.21.0",
     "ruff>=0.15.21",
 ]

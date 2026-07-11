@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -56,8 +56,14 @@ class FakeProcess:
     def __init__(self, lines: list[str], exit_code: int = 0) -> None:
         self.stdout = lines
         self._exit_code = exit_code
+        self.terminated = False
+        self.wait_calls = 0
+
+    def terminate(self) -> None:
+        self.terminated = True
 
     def wait(self) -> int:
+        self.wait_calls += 1
         return self._exit_code
 
 
@@ -381,6 +387,122 @@ class LlamaServerControllerTests(unittest.TestCase):
 
 
 class WindowsServerRuntimeTests(unittest.TestCase):
+    @staticmethod
+    def _kernel32(
+        events, current_directory=r"C:\bundle\_MEI123", set_results=None
+    ):
+        kernel32 = MagicMock()
+        results = iter(set_results or [True, True])
+
+        def get_dll_directory(size, buffer):
+            events.append(("get", None))
+            if size == 0:
+                return len(current_directory) + 1
+            buffer.value = current_directory
+            return len(current_directory)
+
+        def set_dll_directory(path):
+            events.append(("set", path))
+            return next(results)
+
+        kernel32.GetDllDirectoryW.side_effect = get_dll_directory
+        kernel32.SetDllDirectoryW.side_effect = set_dll_directory
+        return kernel32
+
+    def test_frozen_start_temporarily_clears_and_restores_dll_directory(self) -> None:
+        events = []
+        kernel32 = self._kernel32(events)
+        process = FakeProcess([])
+
+        def popen(*_args, **_kwargs):
+            events.append(("popen", None))
+            return process
+
+        with (
+            patch.object(sys, "platform", "win32"),
+            patch.object(sys, "frozen", True, create=True),
+            patch("llama_server_manager.shutil.which", return_value="llama-server.exe"),
+            patch("llama_server_manager.ctypes.WinDLL", return_value=kernel32),
+            patch("llama_server_manager.subprocess.Popen", side_effect=popen),
+        ):
+            result = WindowsServerRuntime().start(["llama-server"])
+        self.assertIs(result, process)
+        self.assertEqual(
+            events,
+            [
+                ("get", None),
+                ("get", None),
+                ("set", None),
+                ("popen", None),
+                ("set", r"C:\bundle\_MEI123"),
+            ],
+        )
+
+    def test_frozen_start_restores_dll_directory_when_popen_raises(self) -> None:
+        events = []
+        kernel32 = self._kernel32(events)
+
+        def popen(*_args, **_kwargs):
+            events.append(("popen", None))
+            raise OSError("launch failed")
+
+        with (
+            patch.object(sys, "platform", "win32"),
+            patch.object(sys, "frozen", True, create=True),
+            patch("llama_server_manager.shutil.which", return_value="llama-server.exe"),
+            patch("llama_server_manager.ctypes.WinDLL", return_value=kernel32),
+            patch("llama_server_manager.subprocess.Popen", side_effect=popen),
+        ):
+            with self.assertRaisesRegex(OSError, "launch failed"):
+                WindowsServerRuntime().start(["llama-server"])
+        self.assertEqual(events[-2:], [("popen", None), ("set", r"C:\bundle\_MEI123")])
+
+    def test_restore_failure_terminates_and_reaps_started_process(self) -> None:
+        events = []
+        kernel32 = self._kernel32(events, set_results=[True, False])
+        process = FakeProcess([])
+        with (
+            patch.object(sys, "platform", "win32"),
+            patch.object(sys, "frozen", True, create=True),
+            patch("llama_server_manager.shutil.which", return_value="llama-server.exe"),
+            patch("llama_server_manager.ctypes.WinDLL", return_value=kernel32),
+            patch("llama_server_manager.subprocess.Popen", return_value=process),
+        ):
+            with self.assertRaisesRegex(OSError, "復元"):
+                WindowsServerRuntime().start(["llama-server"])
+
+        self.assertTrue(process.terminated)
+        self.assertEqual(process.wait_calls, 1)
+
+    def test_restore_failure_keeps_popen_failure_as_exception_context(self) -> None:
+        events = []
+        kernel32 = self._kernel32(events, set_results=[True, False])
+        launch_error = OSError("launch failed")
+        with (
+            patch.object(sys, "platform", "win32"),
+            patch.object(sys, "frozen", True, create=True),
+            patch("llama_server_manager.shutil.which", return_value="llama-server.exe"),
+            patch("llama_server_manager.ctypes.WinDLL", return_value=kernel32),
+            patch("llama_server_manager.subprocess.Popen", side_effect=launch_error),
+        ):
+            with self.assertRaisesRegex(OSError, "復元") as raised:
+                WindowsServerRuntime().start(["llama-server"])
+
+        self.assertIs(raised.exception.__context__, launch_error)
+
+    def test_non_frozen_start_does_not_access_dll_directory(self) -> None:
+        process = FakeProcess([])
+        with (
+            patch.object(sys, "platform", "win32"),
+            patch.object(sys, "frozen", False, create=True),
+            patch("llama_server_manager.shutil.which", return_value="llama-server.exe"),
+            patch("llama_server_manager.ctypes.WinDLL") as win_dll,
+            patch("llama_server_manager.subprocess.Popen", return_value=process),
+        ):
+            result = WindowsServerRuntime().start(["llama-server"])
+        self.assertIs(result, process)
+        win_dll.assert_not_called()
+
     def test_refuses_to_report_no_servers_when_tasklist_fails(self) -> None:
         failed_result = subprocess.CompletedProcess(
             args=["tasklist"], returncode=1, stdout="", stderr="access denied"

@@ -6,7 +6,8 @@ import json
 import re
 import shutil
 import subprocess
-from contextlib import contextmanager
+import sys
+from contextlib import contextmanager, suppress
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -17,6 +18,10 @@ from typing import Protocol
 EXECUTABLE_ALIAS = "llama-server"
 SERVER_MUTEX_NAME = r"Global\llama-server-switch"
 MUTEX_SECURITY_SDDL = "D:(A;;0x001F0001;;;WD)"
+
+
+class _DllDirectoryRestoreError(OSError):
+    pass
 
 
 class SecurityAttributes(ctypes.Structure):
@@ -178,21 +183,78 @@ class WindowsServerRuntime:
             timeout=15,
         )
 
+    @contextmanager
+    def _without_frozen_dll_directory(self):
+        # PyInstaller の frozen 実行では sys._MEIPASS も非空で設定される前提。
+        if sys.platform != "win32" or not getattr(sys, "frozen", False):
+            yield
+            return
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        get_dll_directory = kernel32.GetDllDirectoryW
+        get_dll_directory.argtypes = [wintypes.DWORD, wintypes.LPWSTR]
+        get_dll_directory.restype = wintypes.DWORD
+        set_dll_directory = kernel32.SetDllDirectoryW
+        set_dll_directory.argtypes = [wintypes.LPCWSTR]
+        set_dll_directory.restype = wintypes.BOOL
+
+        ctypes.set_last_error(0)
+        required_size = get_dll_directory(0, None)
+        if required_size == 0:
+            error = ctypes.get_last_error()
+            if error:
+                raise OSError(error, "DLL 検索ディレクトリを取得できません。")
+            previous_directory = None
+        else:
+            buffer = ctypes.create_unicode_buffer(required_size)
+            ctypes.set_last_error(0)
+            copied_size = get_dll_directory(required_size, buffer)
+            if copied_size == 0:
+                error = ctypes.get_last_error()
+                if error:
+                    raise OSError(error, "DLL 検索ディレクトリを取得できません。")
+            if copied_size >= required_size:
+                raise OSError("DLL 検索ディレクトリの取得中にサイズが変化しました。")
+            previous_directory = buffer.value
+
+        if not set_dll_directory(None):
+            raise OSError(
+                ctypes.get_last_error(), "DLL 検索ディレクトリを解除できません。"
+            )
+        try:
+            yield
+        finally:
+            if not set_dll_directory(previous_directory):
+                raise _DllDirectoryRestoreError(
+                    ctypes.get_last_error(), "DLL 検索ディレクトリを復元できません。"
+                )
+
     def start(self, command: list[str]) -> RunningProcess:
         if shutil.which(command[0]) is None:
             raise RuntimeError(
                 '"llama-server" が PATH 上に見つかりません。Vulkan ビルドの '\
                 "llama-server.exe を PATH に追加してください。"
             )
-        return subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
+        process = None
+        try:
+            with self._without_frozen_dll_directory():
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+        except _DllDirectoryRestoreError:
+            if process is not None:
+                with suppress(OSError):
+                    process.terminate()
+                with suppress(OSError):
+                    process.wait()
+            raise
+        return process
 
 
 _TOKENS_PER_SECOND = re.compile(

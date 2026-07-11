@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import time
 import tkinter as tk
@@ -14,7 +15,14 @@ from llama_server_manager import (
     WindowsServerRuntime,
 )
 
-CONFIG_PATH = Path(__file__).resolve().parents[1] / "Config.json"
+
+def get_config_path() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "Config.json"
+    return Path(__file__).resolve().parent.parent / "Config.json"
+
+
+CONFIG_PATH = get_config_path()
 EVENT_POLL_INTERVAL_MS = 25
 
 
@@ -30,10 +38,13 @@ class LlamaServerApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("llama-server Switch")
-        self.minsize(720, 440)
+        self.minsize(500, 300)
+        self.geometry("500x300")
 
         self._events: queue.Queue[tuple[str, object]] = queue.Queue()
-        self._operations: queue.Queue[tuple[int, str, ModelConfig | None]] = queue.Queue()
+        self._operations: queue.Queue[tuple[int, str, ModelConfig | None]] = (
+            queue.Queue()
+        )
         self._models: dict[str, ModelConfig] = {}
         self._metrics: dict[str, float] = {}
         self._stop_requested_at: float | None = None
@@ -50,7 +61,9 @@ class LlamaServerApp(tk.Tk):
             on_started=lambda model: self._events.put(
                 ("operation_complete", (self._executing_operation_id, "start", model))
             ),
-            on_exit=lambda exit_code: self._events.put(("server_exit", (time.monotonic(), exit_code))),
+            on_exit=lambda exit_code: self._events.put(
+                ("server_exit", (time.monotonic(), exit_code))
+            ),
         )
         threading.Thread(
             target=self._operation_worker,
@@ -77,14 +90,18 @@ class LlamaServerApp(tk.Tk):
             state="readonly",
         )
         self._model_selector.grid(row=0, column=1, sticky="ew", padx=(8, 8))
-        self._start_button = ttk.Button(container, text="選択モデルを起動", command=self._start)
+        self._start_button = ttk.Button(
+            container, text="選択モデルを起動", command=self._start
+        )
         self._start_button.grid(row=0, column=2, sticky="ew")
-        self._stop_button = ttk.Button(container, text="サーバーを停止", command=self._stop)
+        self._stop_button = ttk.Button(
+            container, text="サーバーを停止", command=self._stop
+        )
         self._stop_button.grid(row=0, column=3, sticky="ew", padx=(8, 0))
 
-        ttk.Button(container, text="Config.json を再読込", command=self._reload_config).grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(10, 10)
-        )
+        ttk.Button(
+            container, text="Config.json を再読込", command=self._reload_config
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 10))
         ttk.Label(container, textvariable=self._status).grid(
             row=1, column=2, columnspan=2, sticky="e", pady=(10, 10)
         )
@@ -95,12 +112,12 @@ class LlamaServerApp(tk.Tk):
         status_tab = ttk.Frame(notebook, padding=18)
         status_tab.columnconfigure(0, weight=1)
         notebook.add(status_tab, text="状態")
-        ttk.Label(status_tab, text="直近の推論速度", font=("Segoe UI", 12, "bold")).grid(
-            row=0, column=0, sticky="w"
-        )
-        ttk.Label(status_tab, textvariable=self._metrics_text, font=("Consolas", 20)).grid(
-            row=1, column=0, sticky="w", pady=(12, 0)
-        )
+        ttk.Label(
+            status_tab, text="直近の推論速度", font=("Segoe UI", 12, "bold")
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            status_tab, textvariable=self._metrics_text, font=("Consolas", 20)
+        ).grid(row=1, column=0, sticky="w", pady=(12, 0))
         ttk.Label(
             status_tab,
             text="PP は prompt processing、Tg は token generation の tokens per second です。",
@@ -140,7 +157,9 @@ class LlamaServerApp(tk.Tk):
     def _start(self) -> None:
         model = self._models.get(self._selected_model.get())
         if model is None:
-            messagebox.showwarning("モデル未選択", "起動するモデルを選択してください。", parent=self)
+            messagebox.showwarning(
+                "モデル未選択", "起動するモデルを選択してください。", parent=self
+            )
             return
 
         self._status.set(f"起動中: {model.name}")
@@ -224,7 +243,9 @@ class LlamaServerApp(tk.Tk):
                     else "サーバーを停止できませんでした。"
                 )
                 self._append_log(message)
-                messagebox.showerror("起動エラー" if is_start else "停止エラー", message, parent=self)
+                messagebox.showerror(
+                    "起動エラー" if is_start else "停止エラー", message, parent=self
+                )
             elif kind == "server_exit":
                 exit_at, exit_code = value  # type: ignore[misc]
                 if (
@@ -236,8 +257,12 @@ class LlamaServerApp(tk.Tk):
                 if exit_code == 0:
                     self._status.set("llama-server は終了しました。")
                 else:
-                    self._status.set(f"llama-server が異常終了しました (終了コード: {exit_code})。")
-                self._append_log(f"llama-server は終了しました (終了コード: {exit_code})。")
+                    self._status.set(
+                        f"llama-server が異常終了しました (終了コード: {exit_code})。"
+                    )
+                self._append_log(
+                    f"llama-server は終了しました (終了コード: {exit_code})。"
+                )
         self.after(EVENT_POLL_INTERVAL_MS, self._drain_events)
 
     def _append_log(self, line: str) -> None:
@@ -249,6 +274,9 @@ class LlamaServerApp(tk.Tk):
 
 def main() -> None:
     app = LlamaServerApp()
+    iconPath = Path(__file__).resolve().parent / "icon" / "favicon.ico"
+    if iconPath.exists():
+        app.iconbitmap(default=iconPath)
     app.mainloop()
 
 
