@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from contextlib import contextmanager, suppress
 import threading
 from collections.abc import Callable, Iterable
@@ -18,6 +19,8 @@ from typing import Protocol
 EXECUTABLE_ALIAS = "llama-server"
 SERVER_MUTEX_NAME = r"Global\llama-server-switch"
 MUTEX_SECURITY_SDDL = "D:(A;;0x001F0001;;;WD)"
+SERVER_STOP_POLL_INTERVAL_SECONDS = 0.1
+SERVER_STOP_MAX_POLLS = 5
 
 
 class _DllDirectoryRestoreError(OSError):
@@ -337,9 +340,17 @@ class LlamaServerController:
             self._generation += 1
 
     def _stop_existing_servers(self) -> None:
-        for pid in self._runtime.find_server_pids():
+        server_pids = self._runtime.find_server_pids()
+        for pid in server_pids:
             self._runtime.terminate_tree(pid)
-        remaining_pids = self._runtime.find_server_pids()
+        remaining_pids: list[int] = []
+        if server_pids:
+            remaining_pids = server_pids
+            for _ in range(SERVER_STOP_MAX_POLLS):
+                time.sleep(SERVER_STOP_POLL_INTERVAL_SECONDS)
+                remaining_pids = self._runtime.find_server_pids()
+                if not remaining_pids:
+                    break
         if remaining_pids:
             pids = ", ".join(map(str, remaining_pids))
             raise RuntimeError(f"llama-server を停止できませんでした (PID: {pids})。")

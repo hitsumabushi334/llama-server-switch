@@ -315,6 +315,29 @@ class LlamaServerControllerTests(unittest.TestCase):
         self.assertEqual(runtime.operation_entries, 1)
         self.assertEqual(runtime.operation_exits, 1)
 
+    def test_stop_waits_for_terminated_server_to_disappear_from_process_list(self) -> None:
+        class DelayedTerminationRuntime(FakeRuntime):
+            def __init__(self) -> None:
+                super().__init__(pids=[35668])
+                self.find_calls = 0
+
+            def find_server_pids(self) -> list[int]:
+                self.find_calls += 1
+                if self.find_calls < 3:
+                    return [35668]
+                return []
+
+            def terminate_tree(self, pid: int) -> None:
+                self.terminated.append(pid)
+
+        runtime = DelayedTerminationRuntime()
+        controller = LlamaServerController(runtime=runtime, on_log=lambda _line: None)
+
+        controller.stop()
+
+        self.assertEqual(runtime.terminated, [35668])
+        self.assertEqual(runtime.find_calls, 3)
+
     def test_start_aborts_when_an_existing_server_cannot_be_terminated(self) -> None:
         class StubbornRuntime(FakeRuntime):
             def terminate_tree(self, pid: int) -> None:
