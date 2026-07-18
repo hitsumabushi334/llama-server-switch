@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+import json
 import subprocess
 
 import queue
@@ -80,8 +82,100 @@ class ServerConfigTests(unittest.TestCase):
 
         self.assertEqual(
             config.models,
-            (ModelConfig(name="Qwen", arguments=("--model", "Qwen.gguf")),),
+            (
+                ModelConfig(
+                    name="Qwen",
+                    arguments=("--model", "Qwen.gguf"),
+                    llama_cpp=None,
+                ),
+            ),
         )
+        self.assertEqual(config.models[0].executable, "llama-server")
+
+    def test_loads_model_specific_llama_cpp_absolute_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "Config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "models": [
+                            {
+                                "name": "Qwen",
+                                "llama_cpp": r"D:\\AI\\llama.cpp\\bin\\llama-server.exe",
+                                "arguments": ["--model", "Qwen.gguf"],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            config = ServerConfig.load(config_path)
+
+        self.assertEqual(
+            config.models,
+            (
+                ModelConfig(
+                    name="Qwen",
+                    arguments=("--model", "Qwen.gguf"),
+                    llama_cpp=r"D:\\AI\\llama.cpp\\bin\\llama-server.exe",
+                ),
+            ),
+        )
+        self.assertEqual(config.models[0].executable, r"D:\\AI\\llama.cpp\\bin\\llama-server.exe")
+
+    def test_loads_model_specific_llama_cpp_unc_path(self) -> None:
+        llama_cpp = r"\\server\share\llama-server.exe"
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "Config.json"
+            config_path.write_text(
+                json.dumps(
+                    {"models": [{"name": "Qwen", "llama_cpp": llama_cpp, "arguments": []}]}
+                ),
+                encoding="utf-8",
+            )
+
+            config = ServerConfig.load(config_path)
+
+        self.assertEqual(config.models[0].llama_cpp, llama_cpp)
+        self.assertEqual(config.models[0].executable, llama_cpp)
+
+    def test_rejects_invalid_llama_cpp_values(self) -> None:
+        invalid_values = (
+            "",
+            r"bin\\llama-server.exe",
+            123,
+            None,
+            r"\\server",
+            "\\\\server\\",
+            r"\\.\C:\llama-server.exe",
+            r"1:\llama-server.exe",
+            r"?:\llama-server.exe",
+            r" :\llama-server.exe",
+        )
+        for invalid_value in invalid_values:
+            with self.subTest(invalid_value=invalid_value), tempfile.TemporaryDirectory() as directory:
+                config_path = Path(directory) / "Config.json"
+                config_path.write_text(
+                    json.dumps(
+                        {
+                            "models": [
+                                {
+                                    "name": "Qwen",
+                                    "llama_cpp": invalid_value,
+                                    "arguments": [],
+                                }
+                            ]
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    ValueError,
+                    r"llama_cpp は空でない絶対パス文字列である必要があります。",
+                ):
+                    ServerConfig.load(config_path)
 
     def test_rejects_duplicate_model_names(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

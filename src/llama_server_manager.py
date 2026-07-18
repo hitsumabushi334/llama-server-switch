@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import ctypes
 import json
+import ntpath
 import re
 import shutil
 import subprocess
@@ -23,6 +24,23 @@ SERVER_STOP_POLL_INTERVAL_SECONDS = 0.1
 SERVER_STOP_MAX_POLLS = 5
 
 
+def _is_windows_absolute_path(path: str) -> bool:
+    drive, _ = ntpath.splitdrive(path)
+    if not ntpath.isabs(path):
+        return False
+    if (
+        len(drive) == 2
+        and drive[0].isascii()
+        and drive[0].isalpha()
+        and drive[1] == ":"
+    ):
+        return True
+    if not drive.startswith(("\\\\", "//")):
+        return False
+    server, *shares = drive[2:].replace("/", "\\").split("\\")
+    return server not in ("", ".", "?") and len(shares) == 1 and bool(shares[0])
+
+
 class _DllDirectoryRestoreError(OSError):
     pass
 
@@ -39,6 +57,11 @@ class SecurityAttributes(ctypes.Structure):
 class ModelConfig:
     name: str
     arguments: tuple[str, ...]
+    llama_cpp: str | None = None
+
+    @property
+    def executable(self) -> str:
+        return self.llama_cpp or EXECUTABLE_ALIAS
 
 
 @dataclass(frozen=True)
@@ -64,6 +87,7 @@ class ServerConfig:
                 raise ValueError(f"models[{index}] はオブジェクトである必要があります。")
             name = entry.get("name")
             arguments = entry.get("arguments")
+            llama_cpp = entry.get("llama_cpp")
             if not isinstance(name, str) or not name.strip():
                 raise ValueError(f"models[{index}].name は空でない文字列である必要があります。")
             if not isinstance(arguments, list) or not all(
@@ -71,11 +95,26 @@ class ServerConfig:
             ):
                 raise ValueError(f"models[{index}].arguments は文字列配列である必要があります。")
 
+            if "llama_cpp" in entry and (
+                not isinstance(llama_cpp, str)
+                or not llama_cpp.strip()
+                or not _is_windows_absolute_path(llama_cpp)
+            ):
+                raise ValueError(
+                    f"models[{index}].llama_cpp は空でない絶対パス文字列である必要があります。"
+                )
+
             normalized_name = name.casefold()
             if normalized_name in names:
                 raise ValueError(f"モデル名が重複しています: {name}")
             names.add(normalized_name)
-            models.append(ModelConfig(name=name, arguments=tuple(arguments)))
+            models.append(
+                ModelConfig(
+                    name=name,
+                    arguments=tuple(arguments),
+                    llama_cpp=llama_cpp,
+                )
+            )
 
         return cls(models=tuple(models))
 
