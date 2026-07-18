@@ -47,3 +47,30 @@ focused 対象には `25 errors, 142 warnings` が残る。主な残存 error �
 ## コミット
 
 型整合修正コミット: `442e3c0f2a5655ec0025ce7984356c1825224550` (`fix: Protocol 型を整合`)
+## 最終レビュー指摘修正
+
+### 指摘
+
+明示した llama.cpp 実行ファイルについて、`shutil.which(executable)` が対象パスを返した後に `subprocess.Popen()` が `OSError` を送出すると、生の `OSError` が伝播していた。設計要件どおり、存在しない場合だけでなく起動できない場合も対象パス付きの日本語 `RuntimeError` にする必要がある。
+
+### RED
+
+`WindowsServerRuntimeTests.test_unlaunchable_model_specific_executable_is_reported_with_path` を追加した。`which` は明示パスを返し、`Popen` は `OSError("launch failed")` を送出する。実装前は `OSError` が捕捉され、`RuntimeError` を要求するアサーションが失敗した。
+
+### 最小修正
+
+`WindowsServerRuntime.start` の既存 `_DllDirectoryRestoreError` ハンドラの直後に `OSError` ハンドラを追加した。明示 executable の場合だけ、次の形式で例外を変換する。
+
+```python
+RuntimeError(f"指定された llama.cpp 実行ファイルを起動できません: {executable} ({error})")
+```
+
+`_DllDirectoryRestoreError` は先に捕捉されるため、DLL 復元失敗の優先処理と開始済みプロセスの terminate/wait 後始末は維持される。`llama-server` alias の `OSError` は従来どおり再送出される。
+
+### GREEN と検証
+
+- 新規 focused test: `Ran 1 test`、`OK`。
+- `WindowsServerRuntimeTests`: `Ran 10 tests`、`OK`。alias の起動失敗、DLL 復元失敗時の例外優先・後始末を含む既存ケースも通過。
+- 全 unittest: 新規テスト追加により `Ran 36 tests`、`OK`（従来の 35 件から 1 件増加）。
+- `uv run ruff check src test tests`: exit 0。
+- `git diff --check`: exit 0。

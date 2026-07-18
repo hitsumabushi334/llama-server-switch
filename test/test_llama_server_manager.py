@@ -583,6 +583,24 @@ class WindowsServerRuntimeTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, re.escape(executable)):
                 WindowsServerRuntime().start([executable])
 
+    def test_unlaunchable_model_specific_executable_is_reported_with_path(self) -> None:
+        executable = r"D:\\llama.cpp\\llama-server.exe"
+        launch_error = OSError("launch failed")
+        with (
+            patch("llama_server_manager.shutil.which", return_value=executable),
+            patch("llama_server_manager.subprocess.Popen", side_effect=launch_error),
+        ):
+            with self.assertRaises(Exception) as raised:
+                WindowsServerRuntime().start([executable])
+
+        self.assertIsInstance(raised.exception, RuntimeError)
+        if isinstance(raised.exception, RuntimeError):
+            self.assertIn(
+                "指定された llama.cpp 実行ファイルを起動できません",
+                str(raised.exception),
+            )
+            self.assertIn(executable, str(raised.exception))
+            self.assertIs(raised.exception.__cause__, launch_error)
     def test_frozen_start_temporarily_clears_and_restores_dll_directory(self) -> None:
         events = []
         kernel32 = self._kernel32(events)

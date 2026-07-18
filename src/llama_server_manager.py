@@ -302,6 +302,12 @@ class WindowsServerRuntime:
                 with suppress(OSError):
                     process.wait()
             raise
+        except OSError as error:
+            if executable != EXECUTABLE_ALIAS:
+                raise RuntimeError(
+                    f"指定された llama.cpp 実行ファイルを起動できません: {executable} ({error})"
+                ) from error
+            raise
         return process
 
 
