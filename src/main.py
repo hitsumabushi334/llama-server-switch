@@ -225,7 +225,7 @@ class LlamaServerApp(tk.Tk):
                     self._metrics.clear()
                     self._metrics_text.set(format_metric_summary(self._metrics))
                     self._status.set(f"起動中: {model.name}")
-                    self._append_log(f"$ llama-server {' '.join(model.arguments)}")
+                    self._append_log(f"$ {model.executable} {' '.join(model.arguments)}")
                 elif operation == "stop" and operation_id == self._stop_request_id:
                     self._stop_requested_at = None
                     self._status.set("すべての llama-server を停止しました。")

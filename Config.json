@@ -2,6 +2,7 @@
   "models": [
     {
       "name": "Ornith 1.0 9B Q6_K",
+      "llama_cpp": "D:\\AI\\llama-cpp-turboquant\\build-vulkan\\bin\\llama-server.exe",
       "arguments": [
         "-m",
         "D:\\AI\\models\\ornith-1.0-9b-Q6_K.gguf",
@@ -64,6 +65,7 @@
     },
     {
       "name": "Gemma 4 26B A4B Q4_K_XL",
+      "llama_cpp": "D:\\AI\\llama-cpp-turboquant\\build-vulkan\\bin\\llama-server.exe",
       "arguments": [
         "-m",
         "D:\\AI\\models\\gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",

@@ -11,6 +11,7 @@ import unittest
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -292,6 +293,39 @@ class OperationQueueTests(unittest.TestCase):
 
         self.assertEqual(app._metrics, {})
         self.assertEqual(app._metrics_text.value, "Tg: -- tok/s | PP: -- tok/s")
+
+    def test_start_completion_logs_selected_executable(self) -> None:
+        class Value:
+            def __init__(self) -> None:
+                self.value: str = ""
+
+            def set(self, value: str) -> None:
+                self.value = value
+
+        executable = r"D:\AI\llama.cpp\bin\llama-server.exe"
+        model = ModelConfig(
+            name="Qwen",
+            llama_cpp=executable,
+            arguments=("--model", "Qwen.gguf"),
+        )
+        app: Any = object.__new__(LlamaServerApp)
+        app._events = queue.Queue()
+        app._events.put(("operation_complete", (1, "start", model)))
+        app._stop_request_id = 0
+        app._stop_requested_at = None
+        app._metrics = {}
+        app._metrics_text = Value()
+        app._status = Value()
+        logs: list[str] = []
+        app._append_log = logs.append
+        app.after = lambda _delay, _callback: None
+
+        app._drain_events()
+
+        self.assertEqual(
+            logs,
+            [f"$ {executable} --model Qwen.gguf"],
+        )
 
     def test_later_stop_request_is_not_cleared_by_an_older_start_completion(self) -> None:
         class Value:
