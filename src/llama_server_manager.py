@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
-from contextlib import contextmanager, suppress
+from contextlib import AbstractContextManager, contextmanager, suppress
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -120,7 +120,8 @@ class ServerConfig:
 
 
 class RunningProcess(Protocol):
-    stdout: Iterable[str]
+    @property
+    def stdout(self) -> Iterable[str]: ...
 
     def wait(self) -> int: ...
 
@@ -132,7 +133,7 @@ class ServerRuntime(Protocol):
 
     def start(self, command: list[str]) -> RunningProcess: ...
 
-    def exclusive_server_operation(self): ...
+    def exclusive_server_operation(self) -> AbstractContextManager[None]: ...
 
 
 class WindowsServerRuntime:

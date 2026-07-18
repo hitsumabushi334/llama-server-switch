@@ -58,7 +58,7 @@ class FakeRuntime:
 
 class FakeProcess:
     def __init__(self, lines: list[str], exit_code: int = 0) -> None:
-        self.stdout = lines
+        self.stdout: list[str] = lines
         self._exit_code = exit_code
         self.terminated = False
         self.wait_calls = 0
