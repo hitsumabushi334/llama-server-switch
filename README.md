@@ -9,7 +9,7 @@ Vulkan ビルド済みの `llama-server.exe` を、モデルごとの設定で�
 `llama_cpp` を省略したモデルは、従来どおり PATH 上の `llama-server` alias を起動します。省略する場合は、起動前に次で解決できることを確認してください。
 
 ```powershell
-where llama-server
+where.exe llama-server
 uv run python src/main.py
 ```
 
