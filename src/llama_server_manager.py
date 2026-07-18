@@ -272,10 +272,15 @@ class WindowsServerRuntime:
                 )
 
     def start(self, command: list[str]) -> RunningProcess:
-        if shutil.which(command[0]) is None:
+        executable = command[0]
+        if shutil.which(executable) is None:
+            if executable == EXECUTABLE_ALIAS:
+                raise RuntimeError(
+                    '"llama-server" が PATH 上に見つかりません。Vulkan ビルドの '
+                    "llama-server.exe を PATH に追加してください。"
+                )
             raise RuntimeError(
-                '"llama-server" が PATH 上に見つかりません。Vulkan ビルドの '\
-                "llama-server.exe を PATH に追加してください。"
+                f"指定された llama.cpp 実行ファイルが見つかりません: {executable}"
             )
         process = None
         try:
@@ -362,7 +367,7 @@ class LlamaServerController:
             self._stop_existing_servers()
             self._generation += 1
             generation = self._generation
-            command = [EXECUTABLE_ALIAS, *model.arguments]
+            command = [model.executable, *model.arguments]
             process = self._runtime.start(command)
             self._process = process
             self._on_started(model)

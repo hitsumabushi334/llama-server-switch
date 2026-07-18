@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 
 import queue
@@ -399,6 +400,22 @@ class LlamaServerControllerTests(unittest.TestCase):
         self.assertEqual(runtime.operation_entries, 1)
         self.assertEqual(runtime.operation_exits, 1)
 
+    def test_start_uses_model_specific_llama_cpp_path(self) -> None:
+        runtime = FakeRuntime()
+        controller = LlamaServerController(runtime=runtime, on_log=lambda _line: None)
+        model = ModelConfig(
+            name="Qwen",
+            llama_cpp=r"D:\AI\llama.cpp\bin\llama-server.exe",
+            arguments=("--model", "Qwen.gguf"),
+        )
+
+        controller.start(model)
+
+        self.assertEqual(
+            runtime.commands,
+            [[r"D:\AI\llama.cpp\bin\llama-server.exe", "--model", "Qwen.gguf"]],
+        )
+
     def test_stop_terminates_servers_not_started_by_this_application(self) -> None:
         runtime = FakeRuntime(pids=[333])
         controller = LlamaServerController(runtime=runtime, on_log=lambda _line: None)
@@ -525,6 +542,12 @@ class WindowsServerRuntimeTests(unittest.TestCase):
         kernel32.GetDllDirectoryW.side_effect = get_dll_directory
         kernel32.SetDllDirectoryW.side_effect = set_dll_directory
         return kernel32
+
+    def test_missing_model_specific_executable_is_reported_with_path(self) -> None:
+        executable = r"D:\missing\llama-server.exe"
+        with patch("llama_server_manager.shutil.which", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, re.escape(executable)):
+                WindowsServerRuntime().start([executable])
 
     def test_frozen_start_temporarily_clears_and_restores_dll_directory(self) -> None:
         events = []
